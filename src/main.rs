@@ -2,23 +2,35 @@
 #![windows_subsystem = "windows"]
 
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use windows::{
     Win32::Foundation::*, Win32::Graphics::Direct3D::*, Win32::Graphics::Direct3D11::*,
     Win32::Graphics::Dxgi::Common::*, Win32::Graphics::Dxgi::*, Win32::Graphics::Gdi::*,
-    Win32::System::LibraryLoader::*, Win32::UI::Input::*, Win32::UI::WindowsAndMessaging::*,
-    core::*,
+    Win32::System::LibraryLoader::*, Win32::UI::WindowsAndMessaging::*, core::*,
 };
 
+#[repr(C)]
+#[allow(non_snake_case, clippy::upper_case_acronyms)]
+struct MSLLHOOKSTRUCT {
+    pt: POINT,
+    mouseData: u32,
+    flags: u32,
+    time: u32,
+    dwExtraInfo: usize,
+}
+
 static EVENT_TX: Mutex<Option<std::sync::mpsc::Sender<Vec<u8>>>> = Mutex::new(None);
-static LAST_DISPLAY_TIME: Mutex<Option<Instant>> = Mutex::new(None);
-static LAST_MOUSE_TIME: Mutex<Option<Instant>> = Mutex::new(None);
+static MOUSE_HOOK: AtomicU64 = AtomicU64::new(0); // Store as u64 to avoid Send/Sync issues
+static START_TIME: Mutex<Option<Instant>> = Mutex::new(None);
+static LAST_DISPLAY_NS: AtomicU64 = AtomicU64::new(0);
+static LAST_MOUSE_NS: AtomicU64 = AtomicU64::new(0);
 
 fn main() -> Result<()> {
     unsafe {
         let result = main_internal();
         if let Err(e) = &result {
-            let error_msg = format!("jerkmon failed to start:\n\n{}", e);
+            let error_msg = format!("jerkmon failed to start:\n\n{e}");
             let wide_msg: Vec<u16> = error_msg.encode_utf16().chain(std::iter::once(0)).collect();
             MessageBoxW(
                 None,
@@ -34,6 +46,7 @@ fn main() -> Result<()> {
 fn main_internal() -> Result<()> {
     let (tx, rx) = std::sync::mpsc::channel();
     *EVENT_TX.lock().unwrap() = Some(tx);
+    *START_TIME.lock().unwrap() = Some(Instant::now());
 
     // Start WebSocket server in a separate thread
     let _ = std::thread::spawn(move || {
@@ -41,7 +54,7 @@ fn main_internal() -> Result<()> {
             Ok(rt) => rt,
             Err(e) => {
                 unsafe {
-                    let error_msg = format!("Failed to create Tokio runtime:\n\n{}", e);
+                    let error_msg = format!("Failed to create Tokio runtime:\n\n{e}");
                     let wide_msg: Vec<u16> =
                         error_msg.encode_utf16().chain(std::iter::once(0)).collect();
                     MessageBoxW(
@@ -63,7 +76,7 @@ fn main_internal() -> Result<()> {
 
         if let Err(e) = result {
             unsafe {
-                let error_msg = format!("WebSocket server thread panicked:\n\n{:?}", e);
+                let error_msg = format!("WebSocket server thread panicked:\n\n{e:?}");
                 let wide_msg: Vec<u16> =
                     error_msg.encode_utf16().chain(std::iter::once(0)).collect();
                 MessageBoxW(
@@ -109,8 +122,7 @@ async fn websocket_server(rx: std::sync::mpsc::Receiver<Vec<u8>>) {
         Err(e) => {
             unsafe {
                 let error_msg = format!(
-                    "Failed to bind WebSocket server to port 12345:\n\n{}\n\nAnother instance might be running.",
-                    e
+                    "Failed to bind WebSocket server to port 12345:\n\n{e}\n\nAnother instance might be running."
                 );
                 let wide_msg: Vec<u16> =
                     error_msg.encode_utf16().chain(std::iter::once(0)).collect();
@@ -202,23 +214,22 @@ fn create_window() -> Result<()> {
             );
         }
 
-        let _ = RegisterRawInputDevices(
-            &[RAWINPUTDEVICE {
-                usUsagePage: 0x01,
-                usUsage: 0x02,
-                dwFlags: RAWINPUTDEVICE_FLAGS(0x00002100), // RIDEV_INPUTSINK | RIDEV_DEVNOTIFY
-                hwndTarget: hwnd,
-            }],
-            std::mem::size_of::<RAWINPUTDEVICE>() as u32,
-        );
+        // Install low-level mouse hook for high-frequency updates
+        let hook = SetWindowsHookExW(
+            WH_MOUSE_LL,
+            Some(low_level_mouse_proc),
+            Some(instance.into()),
+            0,
+        )?;
+        MOUSE_HOOK.store(hook.0 as u64, Ordering::Relaxed);
+
 
         // Initialize Direct3D
         let (_device, swap_chain, context, rtv) = match init_d3d(hwnd) {
             Ok(resources) => resources,
             Err(e) => {
                 let error_msg = format!(
-                    "Direct3D initialization failed:\n\n{}\n\nThe application cannot continue.",
-                    e
+                    "Direct3D initialization failed:\n\n{e}\n\nThe application cannot continue."
                 );
                 let wide_msg: Vec<u16> =
                     error_msg.encode_utf16().chain(std::iter::once(0)).collect();
@@ -257,7 +268,7 @@ fn create_window() -> Result<()> {
             if result.0 == -1 {
                 // Error occurred
                 let err = Error::from_win32();
-                let error_msg = format!("GetMessageW failed: {:?}", err);
+                let error_msg = format!("GetMessageW failed: {err:?}");
                 let wide_msg: Vec<u16> =
                     error_msg.encode_utf16().chain(std::iter::once(0)).collect();
                 MessageBoxW(
@@ -279,8 +290,7 @@ fn create_window() -> Result<()> {
 
         if msg_count < 5 {
             let error_msg = format!(
-                "Window closed after only {} messages. The window may have closed immediately.",
-                msg_count
+                "Window closed after only {msg_count} messages. The window may have closed immediately."
             );
             let wide_msg: Vec<u16> = error_msg.encode_utf16().chain(std::iter::once(0)).collect();
             MessageBoxW(
@@ -299,58 +309,12 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
     unsafe {
         match msg {
             WM_DESTROY => {
-                PostQuitMessage(0);
-                LRESULT(0)
-            }
-            0x00FF => {
-                // WM_INPUT
-                let mut size = 0u32;
-                let _ = GetRawInputData(
-                    HRAWINPUT(lparam.0 as *mut _),
-                    RID_INPUT,
-                    None,
-                    &mut size,
-                    std::mem::size_of::<RAWINPUTHEADER>() as u32,
-                );
-
-                if size > 0 {
-                    let mut buffer = vec![0u8; size as usize];
-                    let result = GetRawInputData(
-                        HRAWINPUT(lparam.0 as *mut _),
-                        RID_INPUT,
-                        Some(buffer.as_mut_ptr() as *mut _),
-                        &mut size,
-                        std::mem::size_of::<RAWINPUTHEADER>() as u32,
-                    );
-
-                    if result > 0 {
-                        let raw_input = &*(buffer.as_ptr() as *const RAWINPUT);
-                        if raw_input.header.dwType == RIM_TYPEMOUSE.0 {
-                            let mouse = raw_input.data.mouse;
-
-                            // Extract raw mouse data (already at hardware resolution)
-                            let dx = mouse.lLastX;
-                            let dy = mouse.lLastY;
-
-                            // Get mouse attributes for extra precision
-                            let flags = mouse.usFlags;
-                            let button_flags = mouse.Anonymous.Anonymous.usButtonFlags;
-                            let button_data = mouse.Anonymous.Anonymous.usButtonData;
-                            let raw_buttons = mouse.ulRawButtons;
-                            let extra_info = mouse.ulExtraInformation;
-
-                            send_raw_mouse_event_extended(
-                                dx,
-                                dy,
-                                flags.0,
-                                button_flags,
-                                button_data,
-                                raw_buttons,
-                                extra_info as usize,
-                            );
-                        }
-                    }
+                // Cleanup mouse hook
+                let hook_value = MOUSE_HOOK.load(Ordering::Relaxed);
+                if hook_value != 0 {
+                    let _ = UnhookWindowsHookEx(HHOOK(hook_value as *mut _));
                 }
+                PostQuitMessage(0);
                 LRESULT(0)
             }
             _ => DefWindowProcW(hwnd, msg, wparam, lparam),
@@ -359,15 +323,19 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
 }
 
 fn send_display_event() {
-    if let (Ok(tx), Ok(mut last_time)) = (EVENT_TX.lock(), LAST_DISPLAY_TIME.lock()) {
+    if let Ok(tx) = EVENT_TX.lock() {
         if let Some(tx) = tx.as_ref() {
-            let now = Instant::now();
-            let delta_ns = last_time.map_or(0, |last| now.duration_since(last).as_nanos() as u64);
-            *last_time = Some(now);
+            if let Ok(start_guard) = START_TIME.lock() {
+                if let Some(start) = *start_guard {
+                    let now_ns = Instant::now().duration_since(start).as_nanos() as u64;
+                    let last_ns = LAST_DISPLAY_NS.swap(now_ns, Ordering::Relaxed);
+                    let delta_ns = now_ns.saturating_sub(last_ns);
 
-            let mut buf = vec![0x00]; // Display event type
-            buf.extend_from_slice(&delta_ns.to_be_bytes());
-            let _ = tx.send(buf);
+                    let mut buf = vec![0x00]; // Display event type
+                    buf.extend_from_slice(&delta_ns.to_be_bytes());
+                    let _ = tx.send(buf);
+                }
+            }
         }
     }
 }
@@ -462,39 +430,66 @@ unsafe fn render_frame(
     }
 }
 
-fn send_raw_mouse_event_extended(
-    dx: i32,
-    dy: i32,
-    flags: u16,
-    button_flags: u16,
-    button_data: u16,
-    raw_buttons: u32,
-    extra_info: usize,
-) {
-    if let (Ok(tx), Ok(mut last_time)) = (EVENT_TX.lock(), LAST_MOUSE_TIME.lock()) {
-        if let Some(tx) = tx.as_ref() {
-            let now = Instant::now();
-            let delta_ns = last_time.map_or(0, |last| now.duration_since(last).as_nanos() as u64);
-            *last_time = Some(now);
 
-            // Enhanced mouse event with more data
-            let mut buf = vec![0x02]; // Enhanced mouse event type
-            buf.extend_from_slice(&delta_ns.to_be_bytes());
+extern "system" fn low_level_mouse_proc(
+    ncode: i32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    unsafe {
+        if ncode >= 0 {
+            let info = &*(lparam.0 as *const MSLLHOOKSTRUCT);
+            
+            // Static variables to track last position
+            static mut LAST_X: i32 = 0;
+            static mut LAST_Y: i32 = 0;
+            static mut INITIALIZED: bool = false;
+            
+            if !INITIALIZED {
+                LAST_X = info.pt.x;
+                LAST_Y = info.pt.y;
+                INITIALIZED = true;
+            }
+            
+            let dx = info.pt.x - LAST_X;
+            let dy = info.pt.y - LAST_Y;
+            
+            // Update position even for 0,0 movement
+            LAST_X = info.pt.x;
+            LAST_Y = info.pt.y;
 
-            // Movement data as floats for sub-pixel precision
-            let dx_f = dx as f32;
-            let dy_f = dy as f32;
-            buf.extend_from_slice(&dx_f.to_be_bytes());
-            buf.extend_from_slice(&dy_f.to_be_bytes());
-
-            // Additional mouse data
-            buf.extend_from_slice(&flags.to_be_bytes());
-            buf.extend_from_slice(&button_flags.to_be_bytes());
-            buf.extend_from_slice(&button_data.to_be_bytes());
-            buf.extend_from_slice(&raw_buttons.to_be_bytes());
-            buf.extend_from_slice(&(extra_info as u64).to_be_bytes());
-
-            let _ = tx.send(buf);
+            {
+                if let Ok(tx) = EVENT_TX.lock() {
+                    if let Some(tx) = tx.as_ref() {
+                        if let Ok(start_guard) = START_TIME.lock() {
+                            if let Some(start) = *start_guard {
+                                let now_ns = Instant::now().duration_since(start).as_nanos() as u64;
+                                let last_ns = LAST_MOUSE_NS.swap(now_ns, Ordering::Relaxed);
+                                let delta_ns = now_ns.saturating_sub(last_ns);
+                                
+                                // Send high-frequency mouse event (type 0x04)
+                                let mut buf = vec![0x04];
+                                buf.extend_from_slice(&delta_ns.to_be_bytes());
+                                buf.extend_from_slice(&(dx as f32).to_be_bytes());
+                                buf.extend_from_slice(&(dy as f32).to_be_bytes());
+                                
+                                // Include message type
+                                buf.extend_from_slice(&(wparam.0 as u32).to_be_bytes());
+                                
+                                // Include additional info
+                                buf.extend_from_slice(&info.mouseData.to_be_bytes());
+                                buf.extend_from_slice(&info.flags.to_be_bytes());
+                                buf.extend_from_slice(&info.time.to_be_bytes());
+                                buf.extend_from_slice(&(info.dwExtraInfo as u64).to_be_bytes());
+                                
+                                let _ = tx.send(buf);
+                            }
+                        }
+                    }
+                }
+            }
         }
+        
+        CallNextHookEx(None, ncode, wparam, lparam)
     }
 }
