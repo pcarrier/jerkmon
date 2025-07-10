@@ -1,13 +1,13 @@
 #![cfg(windows)]
 #![windows_subsystem = "windows"]
 
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 use windows::{
-    Win32::Foundation::*, Win32::Graphics::Direct3D::*, Win32::Graphics::Direct3D11::*,
+    core::*, Win32::Foundation::*, Win32::Graphics::Direct3D::*, Win32::Graphics::Direct3D11::*,
     Win32::Graphics::Dxgi::Common::*, Win32::Graphics::Dxgi::*, Win32::Graphics::Gdi::*,
-    Win32::System::LibraryLoader::*, Win32::UI::WindowsAndMessaging::*, core::*,
+    Win32::System::LibraryLoader::*, Win32::UI::WindowsAndMessaging::*,
 };
 
 #[repr(C)]
@@ -20,9 +20,9 @@ struct MSLLHOOKSTRUCT {
     dwExtraInfo: usize,
 }
 
-static EVENT_TX: Mutex<Option<std::sync::mpsc::Sender<Vec<u8>>>> = Mutex::new(None);
-static MOUSE_HOOK: AtomicU64 = AtomicU64::new(0); // Store as u64 to avoid Send/Sync issues
-static START_TIME: Mutex<Option<Instant>> = Mutex::new(None);
+static EVENT_TX: OnceLock<std::sync::mpsc::Sender<Vec<u8>>> = OnceLock::new();
+static MOUSE_HOOK: AtomicU64 = AtomicU64::new(0);
+static START_TIME: OnceLock<Instant> = OnceLock::new();
 static LAST_DISPLAY_NS: AtomicU64 = AtomicU64::new(0);
 static LAST_MOUSE_NS: AtomicU64 = AtomicU64::new(0);
 
@@ -45,10 +45,9 @@ fn main() -> Result<()> {
 
 fn main_internal() -> Result<()> {
     let (tx, rx) = std::sync::mpsc::channel();
-    *EVENT_TX.lock().unwrap() = Some(tx);
-    *START_TIME.lock().unwrap() = Some(Instant::now());
+    let _ = EVENT_TX.set(tx);
+    let _ = START_TIME.set(Instant::now());
 
-    // Start WebSocket server in a separate thread
     let _ = std::thread::spawn(move || {
         let rt = match tokio::runtime::Runtime::new() {
             Ok(rt) => rt,
@@ -63,6 +62,7 @@ fn main_internal() -> Result<()> {
                         w!("WebSocket Server Error"),
                         MB_OK | MB_ICONERROR,
                     );
+                    PostQuitMessage(0);
                 }
                 return;
             }
@@ -177,7 +177,7 @@ fn create_window() -> Result<()> {
         let wc = WNDCLASSW {
             style: CS_HREDRAW | CS_VREDRAW,
             lpfnWndProc: Some(wnd_proc),
-            hInstance: HINSTANCE(instance.0),
+            hInstance: instance.into(),
             lpszClassName: class,
             hbrBackground: HBRUSH(GetStockObject(BLACK_BRUSH).0),
             ..Default::default()
@@ -195,34 +195,16 @@ fn create_window() -> Result<()> {
             100,
             None,
             None,
-            Some(instance.into()),
+            Some(HINSTANCE(instance.0)),
             None,
         )?;
 
         let _ = ShowWindow(hwnd, SW_SHOW);
         let _ = UpdateWindow(hwnd);
 
-        // Verify window is actually visible
-        if !IsWindowVisible(hwnd).as_bool() {
-            let error_msg = "Window was created but is not visible!";
-            let wide_msg: Vec<u16> = error_msg.encode_utf16().chain(std::iter::once(0)).collect();
-            MessageBoxW(
-                Some(hwnd),
-                PCWSTR::from_raw(wide_msg.as_ptr()),
-                w!("Window Visibility Error"),
-                MB_OK | MB_ICONERROR,
-            );
-        }
-
         // Install low-level mouse hook for high-frequency updates
-        let hook = SetWindowsHookExW(
-            WH_MOUSE_LL,
-            Some(low_level_mouse_proc),
-            Some(instance.into()),
-            0,
-        )?;
+        let hook = SetWindowsHookExW(WH_MOUSE_LL, Some(low_level_mouse_proc), Some(HINSTANCE(instance.0)), 0)?;
         MOUSE_HOOK.store(hook.0 as u64, Ordering::Relaxed);
-
 
         // Initialize Direct3D
         let (_device, swap_chain, context, rtv) = match init_d3d(hwnd) {
@@ -243,13 +225,11 @@ fn create_window() -> Result<()> {
             }
         };
 
-        // Store D3D resources in static variables for the render thread
         static D3D_RESOURCES: Mutex<
             Option<(ID3D11DeviceContext, ID3D11RenderTargetView, IDXGISwapChain)>,
         > = Mutex::new(None);
         *D3D_RESOURCES.lock().unwrap() = Some((context, rtv, swap_chain));
 
-        // Start render thread for vsync
         let render_hwnd = hwnd.0 as isize;
         std::thread::spawn(move || {
             while IsWindow(Some(HWND(render_hwnd as *mut _))).as_bool() {
@@ -262,7 +242,6 @@ fn create_window() -> Result<()> {
         });
 
         let mut msg = MSG::default();
-        let mut msg_count = 0;
         loop {
             let result = GetMessageW(&mut msg, None, 0, 0);
             if result.0 == -1 {
@@ -282,25 +261,9 @@ fn create_window() -> Result<()> {
                 // WM_QUIT received
                 break;
             }
-
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
-            msg_count += 1;
         }
-
-        if msg_count < 5 {
-            let error_msg = format!(
-                "Window closed after only {msg_count} messages. The window may have closed immediately."
-            );
-            let wide_msg: Vec<u16> = error_msg.encode_utf16().chain(std::iter::once(0)).collect();
-            MessageBoxW(
-                None,
-                PCWSTR::from_raw(wide_msg.as_ptr()),
-                w!("Early Exit Warning"),
-                MB_OK | MB_ICONWARNING,
-            );
-        }
-
         Ok(())
     }
 }
@@ -309,7 +272,6 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
     unsafe {
         match msg {
             WM_DESTROY => {
-                // Cleanup mouse hook
                 let hook_value = MOUSE_HOOK.load(Ordering::Relaxed);
                 if hook_value != 0 {
                     let _ = UnhookWindowsHookEx(HHOOK(hook_value as *mut _));
@@ -322,20 +284,31 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
     }
 }
 
-fn send_display_event() {
-    if let Ok(tx) = EVENT_TX.lock() {
-        if let Some(tx) = tx.as_ref() {
-            if let Ok(start_guard) = START_TIME.lock() {
-                if let Some(start) = *start_guard {
-                    let now_ns = Instant::now().duration_since(start).as_nanos() as u64;
-                    let last_ns = LAST_DISPLAY_NS.swap(now_ns, Ordering::Relaxed);
-                    let delta_ns = now_ns.saturating_sub(last_ns);
+fn send_display_event(swap_chain: &IDXGISwapChain) {
+    // Report every display refresh event without filtering
+    if let Some(tx) = EVENT_TX.get() {
+        if let Some(start) = START_TIME.get() {
+            let now_ns = Instant::now().duration_since(*start).as_nanos() as u64;
+            let last_ns = LAST_DISPLAY_NS.swap(now_ns, Ordering::Relaxed);
+            let delta_ns = now_ns.saturating_sub(last_ns);
 
-                    let mut buf = vec![0x00]; // Display event type
-                    buf.extend_from_slice(&delta_ns.to_be_bytes());
-                    let _ = tx.send(buf);
-                }
+            let mut buf = vec![0x00]; // Display event type
+            buf.extend_from_slice(&delta_ns.to_be_bytes());
+
+            // Try to get frame statistics if available
+            let mut stats = DXGI_FRAME_STATISTICS::default();
+            if unsafe { swap_chain.GetFrameStatistics(&mut stats) }.is_ok() {
+                buf.extend_from_slice(&stats.PresentCount.to_be_bytes());
+                buf.extend_from_slice(&stats.PresentRefreshCount.to_be_bytes());
+                buf.extend_from_slice(&stats.SyncRefreshCount.to_be_bytes());
+            } else {
+                // Send zeros if stats unavailable
+                buf.extend_from_slice(&0u32.to_be_bytes());
+                buf.extend_from_slice(&0u32.to_be_bytes());
+                buf.extend_from_slice(&0u32.to_be_bytes());
             }
+
+            let _ = tx.send(buf);
         }
     }
 }
@@ -375,7 +348,7 @@ unsafe fn init_d3d(
         OutputWindow: hwnd,
         Windowed: BOOL::from(true),
         SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
-        Flags: 0,
+        Flags: DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH.0 as u32,
     };
 
     let mut swap_chain: Option<IDXGISwapChain> = None;
@@ -420,76 +393,54 @@ unsafe fn render_frame(
     rtv: &ID3D11RenderTargetView,
     swap_chain: &IDXGISwapChain,
 ) {
-    let clear_color = [0.1f32, 0.2f32, 0.3f32, 1.0f32];
+    let clear_color = [0.0f32, 0.0f32, 0.0f32, 1.0f32];
     unsafe {
         context.ClearRenderTargetView(rtv, &clear_color);
     }
-    send_display_event();
     unsafe {
-        let _ = swap_chain.Present(1, DXGI_PRESENT(0));
+        if swap_chain.Present(1, DXGI_PRESENT(0)).is_ok() {
+            send_display_event(swap_chain);
+        }
     }
 }
 
-
-extern "system" fn low_level_mouse_proc(
-    ncode: i32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-) -> LRESULT {
+extern "system" fn low_level_mouse_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     unsafe {
         if ncode >= 0 {
             let info = &*(lparam.0 as *const MSLLHOOKSTRUCT);
-            
-            // Static variables to track last position
             static mut LAST_X: i32 = 0;
             static mut LAST_Y: i32 = 0;
             static mut INITIALIZED: bool = false;
-            
+
             if !INITIALIZED {
                 LAST_X = info.pt.x;
                 LAST_Y = info.pt.y;
                 INITIALIZED = true;
             }
-            
+
             let dx = info.pt.x - LAST_X;
             let dy = info.pt.y - LAST_Y;
-            
-            // Update position even for 0,0 movement
+
             LAST_X = info.pt.x;
             LAST_Y = info.pt.y;
 
             {
-                if let Ok(tx) = EVENT_TX.lock() {
-                    if let Some(tx) = tx.as_ref() {
-                        if let Ok(start_guard) = START_TIME.lock() {
-                            if let Some(start) = *start_guard {
-                                let now_ns = Instant::now().duration_since(start).as_nanos() as u64;
-                                let last_ns = LAST_MOUSE_NS.swap(now_ns, Ordering::Relaxed);
-                                let delta_ns = now_ns.saturating_sub(last_ns);
-                                
-                                // Send high-frequency mouse event (type 0x04)
-                                let mut buf = vec![0x04];
-                                buf.extend_from_slice(&delta_ns.to_be_bytes());
-                                buf.extend_from_slice(&(dx as f32).to_be_bytes());
-                                buf.extend_from_slice(&(dy as f32).to_be_bytes());
-                                
-                                // Include message type
-                                buf.extend_from_slice(&(wparam.0 as u32).to_be_bytes());
-                                
-                                // Include additional info
-                                buf.extend_from_slice(&info.mouseData.to_be_bytes());
-                                buf.extend_from_slice(&info.flags.to_be_bytes());
-                                buf.extend_from_slice(&info.time.to_be_bytes());
-                                buf.extend_from_slice(&(info.dwExtraInfo as u64).to_be_bytes());
-                                
-                                let _ = tx.send(buf);
-                            }
-                        }
+                if let Some(tx) = EVENT_TX.get() {
+                    if let Some(start) = START_TIME.get() {
+                        let now_ns = Instant::now().duration_since(*start).as_nanos() as u64;
+                        let last_ns = LAST_MOUSE_NS.swap(now_ns, Ordering::Relaxed);
+                        let delta_ns = now_ns.saturating_sub(last_ns);
+                        let mut buf = vec![0x04];
+                        buf.extend_from_slice(&delta_ns.to_be_bytes());
+                        buf.extend_from_slice(&(dx as f32).to_be_bytes());
+                        buf.extend_from_slice(&(dy as f32).to_be_bytes());
+
+                        let _ = tx.send(buf);
                     }
                 }
             }
         }
-        
+
         CallNextHookEx(None, ncode, wparam, lparam)
     }
 }
