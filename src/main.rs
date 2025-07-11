@@ -1,67 +1,90 @@
 #![cfg(windows)]
 #![windows_subsystem = "windows"]
 
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
-use std::time::Instant;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+
 use windows::{
-    core::*, Win32::Foundation::*, Win32::Graphics::Direct3D::*, Win32::Graphics::Direct3D11::*,
-    Win32::Graphics::Dxgi::Common::*, Win32::Graphics::Dxgi::*, Win32::Graphics::Gdi::*,
-    Win32::System::LibraryLoader::*, Win32::UI::WindowsAndMessaging::*,
+    Win32::Foundation::*,
+    Win32::Graphics::{
+        Direct3D::*,
+        Direct3D11::*,
+        Dxgi::{Common::*, *},
+        Gdi::*,
+    },
+    Win32::System::LibraryLoader::*,
+    Win32::UI::{Input::*, WindowsAndMessaging::*},
+    core::*,
 };
 
-#[repr(C)]
-#[allow(non_snake_case, clippy::upper_case_acronyms)]
-struct MSLLHOOKSTRUCT {
-    pt: POINT,
-    mouseData: u32,
-    flags: u32,
-    time: u32,
-    dwExtraInfo: usize,
-}
+// Event types
+const EVENT_TYPE_DISPLAY: u8 = 0x00;
+const EVENT_TYPE_MOUSE: u8 = 0x04;
 
-static EVENT_TX: OnceLock<std::sync::mpsc::Sender<Vec<u8>>> = OnceLock::new();
-static MOUSE_HOOK: AtomicU64 = AtomicU64::new(0);
+// Window constants
+const WINDOW_WIDTH: i32 = 100;
+const WINDOW_HEIGHT: i32 = 100;
+
+// HID constants
+const HID_USAGE_PAGE_GENERIC: u16 = 0x01;
+const HID_USAGE_GENERIC_MOUSE: u16 = 0x02;
+
+// WebSocket server address
+const WS_BIND_ADDR: &str = "127.0.0.1:12345";
+
+// Polling interval for raw input
+const RAW_INPUT_POLL_INTERVAL: Duration = Duration::from_micros(10);
+
+// Global state
+static EVENT_TX: OnceLock<crossbeam_channel::Sender<Vec<u8>>> = OnceLock::new();
 static START_TIME: OnceLock<Instant> = OnceLock::new();
 static LAST_DISPLAY_NS: AtomicU64 = AtomicU64::new(0);
 static LAST_MOUSE_NS: AtomicU64 = AtomicU64::new(0);
+static RUNNING: AtomicBool = AtomicBool::new(true);
 
 fn main() -> Result<()> {
+    let result = main_internal();
+    if let Err(e) = &result {
+        show_error_dialog(None, "jerkmon failed to start", &format!("{e}"));
+    }
+    result
+}
+
+fn show_error_dialog(hwnd: Option<HWND>, title: &str, message: &str) {
     unsafe {
-        let result = main_internal();
-        if let Err(e) = &result {
-            let error_msg = format!("jerkmon failed to start:\n\n{e}");
-            let wide_msg: Vec<u16> = error_msg.encode_utf16().chain(std::iter::once(0)).collect();
-            MessageBoxW(
-                None,
-                PCWSTR::from_raw(wide_msg.as_ptr()),
-                w!("jerkmon error"),
-                MB_OK | MB_ICONERROR,
-            );
-        }
-        result
+        let wide_title = encode_wide(title);
+        let wide_msg = encode_wide(message);
+        MessageBoxW(
+            hwnd,
+            PCWSTR::from_raw(wide_msg.as_ptr()),
+            PCWSTR::from_raw(wide_title.as_ptr()),
+            MB_OK | MB_ICONERROR,
+        );
     }
 }
 
-fn main_internal() -> Result<()> {
-    let (tx, rx) = std::sync::mpsc::channel();
-    let _ = EVENT_TX.set(tx);
-    let _ = START_TIME.set(Instant::now());
+fn encode_wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
 
-    let _ = std::thread::spawn(move || {
+fn main_internal() -> Result<()> {
+    let (tx, rx) = crossbeam_channel::unbounded();
+    EVENT_TX.set(tx).expect("EVENT_TX already initialized");
+    START_TIME
+        .set(Instant::now())
+        .expect("START_TIME already initialized");
+
+    std::thread::spawn(move || {
         let rt = match tokio::runtime::Runtime::new() {
             Ok(rt) => rt,
             Err(e) => {
+                show_error_dialog(
+                    None,
+                    "WebSocket Server Error",
+                    &format!("Failed to create Tokio runtime:\n\n{e}"),
+                );
                 unsafe {
-                    let error_msg = format!("Failed to create Tokio runtime:\n\n{e}");
-                    let wide_msg: Vec<u16> =
-                        error_msg.encode_utf16().chain(std::iter::once(0)).collect();
-                    MessageBoxW(
-                        None,
-                        PCWSTR::from_raw(wide_msg.as_ptr()),
-                        w!("WebSocket Server Error"),
-                        MB_OK | MB_ICONERROR,
-                    );
                     PostQuitMessage(0);
                 }
                 return;
@@ -75,17 +98,11 @@ fn main_internal() -> Result<()> {
         }));
 
         if let Err(e) = result {
-            unsafe {
-                let error_msg = format!("WebSocket server thread panicked:\n\n{e:?}");
-                let wide_msg: Vec<u16> =
-                    error_msg.encode_utf16().chain(std::iter::once(0)).collect();
-                MessageBoxW(
-                    None,
-                    PCWSTR::from_raw(wide_msg.as_ptr()),
-                    w!("WebSocket Server Panic"),
-                    MB_OK | MB_ICONERROR,
-                );
-            }
+            show_error_dialog(
+                None,
+                "WebSocket Server Panic",
+                &format!("WebSocket server thread panicked:\n\n{e:?}"),
+            );
         }
     });
 
@@ -93,7 +110,8 @@ fn main_internal() -> Result<()> {
     create_window()
 }
 
-async fn websocket_server(rx: std::sync::mpsc::Receiver<Vec<u8>>) {
+/// WebSocket server that broadcasts events to all connected clients.
+async fn websocket_server(rx: crossbeam_channel::Receiver<Vec<u8>>) {
     use futures_util::{SinkExt, StreamExt};
     use tokio::net::TcpListener;
     use tokio_tungstenite::{accept_async, tungstenite::Message};
@@ -117,22 +135,17 @@ async fn websocket_server(rx: std::sync::mpsc::Receiver<Vec<u8>>) {
         }
     });
 
-    let listener = match TcpListener::bind("127.0.0.1:12345").await {
+    let listener = match TcpListener::bind(WS_BIND_ADDR).await {
         Ok(l) => l,
         Err(e) => {
-            unsafe {
-                let error_msg = format!(
-                    "Failed to bind WebSocket server to port 12345:\n\n{e}\n\nAnother instance might be running."
-                );
-                let wide_msg: Vec<u16> =
-                    error_msg.encode_utf16().chain(std::iter::once(0)).collect();
-                MessageBoxW(
-                    None,
-                    PCWSTR::from_raw(wide_msg.as_ptr()),
-                    w!("WebSocket Server Error"),
-                    MB_OK | MB_ICONERROR,
-                );
-            }
+            show_error_dialog(
+                None,
+                "WebSocket Server Error",
+                &format!(
+                    "Failed to bind WebSocket server to {}:\n\n{e}\n\nAnother instance might be running.",
+                    WS_BIND_ADDR
+                ),
+            );
             return;
         }
     };
@@ -191,8 +204,8 @@ fn create_window() -> Result<()> {
             WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_VISIBLE,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
-            100,
-            100,
+            WINDOW_WIDTH,
+            WINDOW_HEIGHT,
             None,
             None,
             Some(HINSTANCE(instance.0)),
@@ -202,44 +215,35 @@ fn create_window() -> Result<()> {
         let _ = ShowWindow(hwnd, SW_SHOW);
         let _ = UpdateWindow(hwnd);
 
-        // Install low-level mouse hook for high-frequency updates
-        let hook = SetWindowsHookExW(WH_MOUSE_LL, Some(low_level_mouse_proc), Some(HINSTANCE(instance.0)), 0)?;
-        MOUSE_HOOK.store(hook.0 as u64, Ordering::Relaxed);
+        // Register for raw input from mouse devices
+        let rid = RAWINPUTDEVICE {
+            usUsagePage: HID_USAGE_PAGE_GENERIC,
+            usUsage: HID_USAGE_GENERIC_MOUSE,
+            dwFlags: RIDEV_INPUTSINK, // Receive input even when not in foreground
+            hwndTarget: hwnd,
+        };
+        RegisterRawInputDevices(&[rid], std::mem::size_of::<RAWINPUTDEVICE>() as u32)?;
 
-        // Initialize Direct3D
-        let (_device, swap_chain, context, rtv) = match init_d3d(hwnd) {
-            Ok(resources) => resources,
+        // Start a dedicated thread for processing raw input more frequently
+        let polling_hwnd = hwnd.0 as isize;
+        std::thread::spawn(move || {
+            process_raw_input_continuously(HWND(polling_hwnd as *mut _));
+        });
+
+        // Initialize minimal DXGI for vblank monitoring
+        match init_minimal_dxgi(hwnd) {
+            Ok((swap_chain, output)) => {
+                start_vblank_thread(swap_chain, output);
+            }
             Err(e) => {
-                let error_msg = format!(
-                    "Direct3D initialization failed:\n\n{e}\n\nThe application cannot continue."
-                );
-                let wide_msg: Vec<u16> =
-                    error_msg.encode_utf16().chain(std::iter::once(0)).collect();
-                MessageBoxW(
+                show_error_dialog(
                     Some(hwnd),
-                    PCWSTR::from_raw(wide_msg.as_ptr()),
-                    w!("Graphics Initialization Error"),
-                    MB_OK | MB_ICONERROR,
+                    "DXGI Initialization Error",
+                    &format!("Failed to initialize DXGI for vblank monitoring:\n\n{e}"),
                 );
                 return Err(e);
             }
-        };
-
-        static D3D_RESOURCES: Mutex<
-            Option<(ID3D11DeviceContext, ID3D11RenderTargetView, IDXGISwapChain)>,
-        > = Mutex::new(None);
-        *D3D_RESOURCES.lock().unwrap() = Some((context, rtv, swap_chain));
-
-        let render_hwnd = hwnd.0 as isize;
-        std::thread::spawn(move || {
-            while IsWindow(Some(HWND(render_hwnd as *mut _))).as_bool() {
-                if let Ok(resources) = D3D_RESOURCES.lock() {
-                    if let Some((ref context, ref rtv, ref swap_chain)) = *resources {
-                        render_frame(context, rtv, swap_chain);
-                    }
-                }
-            }
-        });
+        }
 
         let mut msg = MSG::default();
         loop {
@@ -247,14 +251,10 @@ fn create_window() -> Result<()> {
             if result.0 == -1 {
                 // Error occurred
                 let err = Error::from_win32();
-                let error_msg = format!("GetMessageW failed: {err:?}");
-                let wide_msg: Vec<u16> =
-                    error_msg.encode_utf16().chain(std::iter::once(0)).collect();
-                MessageBoxW(
+                show_error_dialog(
                     Some(hwnd),
-                    PCWSTR::from_raw(wide_msg.as_ptr()),
-                    w!("Message Loop Error"),
-                    MB_OK | MB_ICONERROR,
+                    "Message Loop Error",
+                    &format!("GetMessageW failed: {err:?}"),
                 );
                 return Err(err);
             } else if result.0 == 0 {
@@ -271,11 +271,13 @@ fn create_window() -> Result<()> {
 extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     unsafe {
         match msg {
+            WM_INPUT => {
+                // Process the message to keep them flowing
+                process_single_raw_input(lparam);
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
             WM_DESTROY => {
-                let hook_value = MOUSE_HOOK.load(Ordering::Relaxed);
-                if hook_value != 0 {
-                    let _ = UnhookWindowsHookEx(HHOOK(hook_value as *mut _));
-                }
+                RUNNING.store(false, Ordering::Relaxed);
                 PostQuitMessage(0);
                 LRESULT(0)
             }
@@ -284,78 +286,60 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
     }
 }
 
-fn send_display_event(swap_chain: &IDXGISwapChain) {
-    // Report every display refresh event without filtering
+/// Sends a display refresh event with timing information.
+fn send_display_event() {
     if let Some(tx) = EVENT_TX.get() {
         if let Some(start) = START_TIME.get() {
             let now_ns = Instant::now().duration_since(*start).as_nanos() as u64;
             let last_ns = LAST_DISPLAY_NS.swap(now_ns, Ordering::Relaxed);
             let delta_ns = now_ns.saturating_sub(last_ns);
 
-            let mut buf = vec![0x00]; // Display event type
+            let mut buf = vec![EVENT_TYPE_DISPLAY];
             buf.extend_from_slice(&delta_ns.to_be_bytes());
 
-            // Try to get frame statistics if available
-            let mut stats = DXGI_FRAME_STATISTICS::default();
-            if unsafe { swap_chain.GetFrameStatistics(&mut stats) }.is_ok() {
-                buf.extend_from_slice(&stats.PresentCount.to_be_bytes());
-                buf.extend_from_slice(&stats.PresentRefreshCount.to_be_bytes());
-                buf.extend_from_slice(&stats.SyncRefreshCount.to_be_bytes());
-            } else {
-                // Send zeros if stats unavailable
-                buf.extend_from_slice(&0u32.to_be_bytes());
-                buf.extend_from_slice(&0u32.to_be_bytes());
-                buf.extend_from_slice(&0u32.to_be_bytes());
-            }
+            // No frame statistics available without D3D
+            buf.extend_from_slice(&0u32.to_be_bytes());
+            buf.extend_from_slice(&0u32.to_be_bytes());
+            buf.extend_from_slice(&0u32.to_be_bytes());
 
             let _ = tx.send(buf);
         }
     }
 }
 
-unsafe fn init_d3d(
-    hwnd: HWND,
-) -> Result<(
-    ID3D11Device,
-    IDXGISwapChain,
-    ID3D11DeviceContext,
-    ID3D11RenderTargetView,
-)> {
-    // Get window size
-    let mut rect = RECT::default();
-    unsafe { _ = GetClientRect(hwnd, &mut rect) };
-    let width = (rect.right - rect.left) as u32;
-    let height = (rect.bottom - rect.top) as u32;
-
-    let swap_chain_desc = DXGI_SWAP_CHAIN_DESC {
-        BufferDesc: DXGI_MODE_DESC {
-            Width: width,
-            Height: height,
-            RefreshRate: DXGI_RATIONAL {
-                Numerator: 0,
-                Denominator: 0,
-            },
-            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
-            ScanlineOrdering: DXGI_MODE_SCANLINE_ORDER_UNSPECIFIED,
-            Scaling: DXGI_MODE_SCALING_UNSPECIFIED,
-        },
-        SampleDesc: DXGI_SAMPLE_DESC {
-            Count: 1,
-            Quality: 0,
-        },
-        BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
-        BufferCount: 2,
-        OutputWindow: hwnd,
-        Windowed: BOOL::from(true),
-        SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
-        Flags: DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH.0 as u32,
-    };
-
-    let mut swap_chain: Option<IDXGISwapChain> = None;
-    let mut device: Option<ID3D11Device> = None;
-    let mut context: Option<ID3D11DeviceContext> = None;
-
+/// Initialize minimal DXGI swap chain (1x1 pixel) for vblank monitoring
+fn init_minimal_dxgi(hwnd: HWND) -> Result<(IDXGISwapChain, IDXGIOutput)> {
     unsafe {
+        // Create a minimal swap chain description (1x1 pixel)
+        let swap_chain_desc = DXGI_SWAP_CHAIN_DESC {
+            BufferDesc: DXGI_MODE_DESC {
+                Width: 1,
+                Height: 1,
+                RefreshRate: DXGI_RATIONAL {
+                    Numerator: 0,
+                    Denominator: 0,
+                },
+                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                ScanlineOrdering: DXGI_MODE_SCANLINE_ORDER_UNSPECIFIED,
+                Scaling: DXGI_MODE_SCALING_UNSPECIFIED,
+            },
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
+            BufferCount: 2,
+            OutputWindow: hwnd,
+            Windowed: BOOL::from(true),
+            SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
+            Flags: 0,
+        };
+
+        let mut swap_chain: Option<IDXGISwapChain> = None;
+        let mut device: Option<ID3D11Device> = None;
+        let mut context: Option<ID3D11DeviceContext> = None;
+
+        // Create minimal D3D11 device and swap chain
         D3D11CreateDeviceAndSwapChain(
             None,
             D3D_DRIVER_TYPE_HARDWARE,
@@ -369,78 +353,97 @@ unsafe fn init_d3d(
             None,
             Some(&mut context),
         )?;
-    }
 
-    // Get the unwrapped values
-    let swap_chain = swap_chain.ok_or_else(Error::from_win32)?;
-    let device = device.ok_or_else(Error::from_win32)?;
-    let context = context.ok_or_else(Error::from_win32)?;
+        let swap_chain = swap_chain.ok_or_else(Error::from_win32)?;
 
-    // Create render target view
-    let back_buffer: ID3D11Texture2D = unsafe { swap_chain.GetBuffer(0)? };
-    let mut render_target_view: Option<ID3D11RenderTargetView> = None;
-    unsafe {
-        device.CreateRenderTargetView(&back_buffer, None, Some(&mut render_target_view))?;
-    }
+        // Get the output (monitor) for VBlank synchronization
+        let output: IDXGIOutput = swap_chain.GetContainingOutput()?;
 
-    let rtv = render_target_view.ok_or_else(Error::from_win32)?;
-
-    Ok((device, swap_chain, context, rtv))
-}
-
-unsafe fn render_frame(
-    context: &ID3D11DeviceContext,
-    rtv: &ID3D11RenderTargetView,
-    swap_chain: &IDXGISwapChain,
-) {
-    let clear_color = [0.0f32, 0.0f32, 0.0f32, 1.0f32];
-    unsafe {
-        context.ClearRenderTargetView(rtv, &clear_color);
-    }
-    unsafe {
-        if swap_chain.Present(1, DXGI_PRESENT(0)).is_ok() {
-            send_display_event(swap_chain);
-        }
+        Ok((swap_chain, output))
     }
 }
 
-extern "system" fn low_level_mouse_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    unsafe {
-        if ncode >= 0 {
-            let info = &*(lparam.0 as *const MSLLHOOKSTRUCT);
-            static mut LAST_X: i32 = 0;
-            static mut LAST_Y: i32 = 0;
-            static mut INITIALIZED: bool = false;
-
-            if !INITIALIZED {
-                LAST_X = info.pt.x;
-                LAST_Y = info.pt.y;
-                INITIALIZED = true;
+fn start_vblank_thread(swap_chain: IDXGISwapChain, output: IDXGIOutput) {
+    std::thread::spawn(move || {
+        while RUNNING.load(Ordering::Relaxed) {
+            // Wait for vertical blank using DXGI
+            unsafe {
+                let _ = output.WaitForVBlank();
             }
+            send_display_event();
 
-            let dx = info.pt.x - LAST_X;
-            let dy = info.pt.y - LAST_Y;
+            // Present the swap chain to keep it alive
+            unsafe {
+                let _ = swap_chain.Present(0, DXGI_PRESENT(0));
+            }
+        }
+    });
+}
 
-            LAST_X = info.pt.x;
-            LAST_Y = info.pt.y;
+fn process_single_raw_input(lparam: LPARAM) {
+    unsafe {
+        let mut size = 0u32;
+        GetRawInputData(
+            HRAWINPUT(lparam.0 as *mut _),
+            RID_INPUT,
+            None,
+            &mut size,
+            std::mem::size_of::<RAWINPUTHEADER>() as u32,
+        );
 
-            {
-                if let Some(tx) = EVENT_TX.get() {
-                    if let Some(start) = START_TIME.get() {
-                        let now_ns = Instant::now().duration_since(*start).as_nanos() as u64;
-                        let last_ns = LAST_MOUSE_NS.swap(now_ns, Ordering::Relaxed);
-                        let delta_ns = now_ns.saturating_sub(last_ns);
-                        let mut buf = vec![0x04];
-                        buf.extend_from_slice(&delta_ns.to_be_bytes());
-                        buf.extend_from_slice(&(dx as f32).to_be_bytes());
-                        buf.extend_from_slice(&(dy as f32).to_be_bytes());
+        if size > 0 {
+            let mut buffer = vec![0u8; size as usize];
+            let result = GetRawInputData(
+                HRAWINPUT(lparam.0 as *mut _),
+                RID_INPUT,
+                Some(buffer.as_mut_ptr() as *mut _),
+                &mut size,
+                std::mem::size_of::<RAWINPUTHEADER>() as u32,
+            );
 
-                        let _ = tx.send(buf);
-                    }
+            if result != u32::MAX {
+                let raw_input = &*(buffer.as_ptr() as *const RAWINPUT);
+                if raw_input.header.dwType == RIM_TYPEMOUSE.0 {
+                    send_mouse_event(&raw_input.data.mouse);
                 }
             }
         }
+    }
+}
 
-        CallNextHookEx(None, ncode, wparam, lparam)
+fn send_mouse_event(mouse_data: &RAWMOUSE) {
+    let dx = mouse_data.lLastX;
+    let dy = mouse_data.lLastY;
+
+    if dx != 0 || dy != 0 {
+        if let Some(tx) = EVENT_TX.get() {
+            if let Some(start) = START_TIME.get() {
+                let now_ns = Instant::now().duration_since(*start).as_nanos() as u64;
+                let last_ns = LAST_MOUSE_NS.swap(now_ns, Ordering::Relaxed);
+                let delta_ns = now_ns.saturating_sub(last_ns);
+
+                let mut buf = vec![EVENT_TYPE_MOUSE];
+                buf.extend_from_slice(&delta_ns.to_be_bytes());
+                buf.extend_from_slice(&(dx as f32).to_be_bytes());
+                buf.extend_from_slice(&(dy as f32).to_be_bytes());
+
+                let _ = tx.send(buf);
+            }
+        }
+    }
+}
+
+fn process_raw_input_continuously(hwnd: HWND) {
+    unsafe {
+        while RUNNING.load(Ordering::Relaxed) {
+            let mut msg = MSG::default();
+            // Use None for hwnd to get all thread messages, not just window messages
+            while PeekMessageW(&mut msg, None, WM_INPUT, WM_INPUT, PM_REMOVE).as_bool() {
+                let _ = TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+
+            std::thread::sleep(RAW_INPUT_POLL_INTERVAL);
+        }
     }
 }
