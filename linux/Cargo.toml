@@ -1,0 +1,23 @@
+[package]
+name = "jerkmon"
+version = "0.2.0"
+edition = "2024"
+
+[dependencies]
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "net",
+    "sync",
+    "macros",
+    "fs",
+    "time",
+] }
+tokio-tungstenite = "0.24"
+futures-util = "0.3"
+crossbeam-channel = "0.5"
+libc = "0.2"
+nix = { version = "0.29", features = ["ioctl", "fs"] }
+ctrlc = "3.4"
+wayland-client = "0.31"
+wayland-protocols = { version = "0.31", features = ["client"] }
+tempfile = "3.8"
