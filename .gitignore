@@ -1,3 +1,5 @@
+/analyze
+/analyze.exe
 /target/
 /.cargo/
 /.claude/
