@@ -1,3 +1,3 @@
 # jerkmon
 
-A Windows application that monitors display and mouse events and broadcasts them via WebSocket.
+A Windows & Linux Wayland application that monitors display and mouse events and broadcasts them via WebSocket.
