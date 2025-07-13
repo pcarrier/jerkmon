@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"sort"
 	"strings"
 	"time"
 
@@ -52,6 +53,9 @@ func main() {
 	}
 
 	log.Printf("Collected %d mouse movement intervals", len(intervals))
+
+	// Dump the 10 longest delays
+	dumpLongestDelays(intervals, 10)
 
 	if err := generateVisualization(curve, intervals); err != nil {
 		log.Fatalf("Failed to generate visualization: %v", err)
@@ -131,10 +135,9 @@ func generateGnuplotScript(filename, prefix string, intervals []uint64) error {
 	return os.WriteFile(filename, []byte(script), 0644)
 }
 
-
 func formatGnuplotScript(prefix string, intervals []float64) string {
 	var b strings.Builder
-	
+
 	// Find min/max for x-axis range
 	minMs := intervals[0]
 	maxMs := intervals[0]
@@ -178,6 +181,32 @@ plot $data using 1:2 with points pt 7 ps 0.1 lc rgb "blue"
 `)
 
 	return b.String()
+}
+
+func dumpLongestDelays(intervals []uint64, count int) {
+	if len(intervals) == 0 {
+		return
+	}
+
+	// Create a copy to avoid modifying the original
+	sorted := make([]uint64, len(intervals))
+	copy(sorted, intervals)
+
+	// Sort in descending order
+	sort.Slice(sorted, func(i, j int) bool {
+		return sorted[i] > sorted[j]
+	})
+
+	// Determine how many to show
+	if count > len(sorted) {
+		count = len(sorted)
+	}
+
+	log.Printf("Top %d Longest Delays", count)
+	for i := 0; i < count; i++ {
+		ms := float64(sorted[i]) / 1_000_000.0
+		log.Printf("%2d. %.3f ms (%d ns)\n", i+1, ms, sorted[i])
+	}
 }
 
 func openFile(filename string) error {
