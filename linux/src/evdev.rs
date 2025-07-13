@@ -8,7 +8,7 @@ use std::io::{self, Read};
 use std::os::unix::io::AsRawFd;
 use std::sync::atomic::Ordering;
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use std::mem;
 
 use nix::fcntl::{fcntl, FcntlArg, OFlag};
@@ -126,13 +126,13 @@ fn monitor_device(device_path: &str) -> io::Result<()> {
     let event_size = mem::size_of::<InputEvent>();
     let mut buffer = vec![0u8; event_size * 64]; // Read up to 64 events at once
     
-    let mut accumulated_x = 0i32;
-    let mut accumulated_y = 0i32;
-    
     while RUNNING.load(Ordering::Relaxed) {
         match file.read(&mut buffer) {
             Ok(n) if n >= event_size => {
                 let event_count = n / event_size;
+                let mut x_movement = 0i32;
+                let mut y_movement = 0i32;
+                let mut has_movement = false;
                 
                 for i in 0..event_count {
                     let offset = i * event_size;
@@ -145,23 +145,29 @@ fn monitor_device(device_path: &str) -> io::Result<()> {
                     
                     if event.type_ == EV_REL {
                         match event.code {
-                            REL_X => accumulated_x += event.value,
-                            REL_Y => accumulated_y += event.value,
+                            REL_X => {
+                                x_movement += event.value;
+                                has_movement = true;
+                            }
+                            REL_Y => {
+                                y_movement += event.value;
+                                has_movement = true;
+                            }
                             _ => {}
                         }
                     }
                 }
                 
-                // Send accumulated movement
-                if accumulated_x != 0 || accumulated_y != 0 {
-                    send_mouse_event(accumulated_x as f32, accumulated_y as f32);
-                    accumulated_x = 0;
-                    accumulated_y = 0;
+                // Send event if there was any movement in this read
+                if has_movement {
+                    send_mouse_event(x_movement as f32, y_movement as f32);
                 }
             }
             Ok(_) => continue,
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(1)); // More responsive than HIDRAW's 10ms
+                // Yield to other threads but continue polling immediately
+                std::thread::yield_now();
+                continue;
             }
             Err(e) => return Err(e),
         }
