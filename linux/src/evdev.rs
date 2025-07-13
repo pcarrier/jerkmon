@@ -8,10 +8,9 @@ use std::io::{self, Read};
 use std::os::unix::io::AsRawFd;
 use std::sync::atomic::Ordering;
 use std::thread::JoinHandle;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use std::mem;
 
-use nix::fcntl::{fcntl, FcntlArg, OFlag};
 
 use crate::{send_event, utils, EVENT_TYPE_MOUSE, LAST_MOUSE_NS, RUNNING, START_TIME};
 
@@ -118,15 +117,40 @@ fn monitor_device(device_path: &str) -> io::Result<()> {
         .read(true)
         .open(device_path)?;
     
-    // Set file to non-blocking mode
     let fd = file.as_raw_fd();
-    let flags = fcntl(fd, FcntlArg::F_GETFL).unwrap();
-    fcntl(fd, FcntlArg::F_SETFL(OFlag::from_bits_truncate(flags) | OFlag::O_NONBLOCK)).unwrap();
     
     let event_size = mem::size_of::<InputEvent>();
     let mut buffer = vec![0u8; event_size * 64]; // Read up to 64 events at once
     
     while RUNNING.load(Ordering::Relaxed) {
+        // Use select() to check if data is available with timeout
+        let mut readfds = unsafe { mem::zeroed::<libc::fd_set>() };
+        unsafe {
+            libc::FD_ZERO(&mut readfds);
+            libc::FD_SET(fd, &mut readfds);
+            
+            let mut timeout = libc::timeval {
+                tv_sec: 0,
+                tv_usec: 100_000, // 100ms timeout
+            };
+            
+            let result = libc::select(
+                fd + 1,
+                &mut readfds,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut timeout,
+            );
+            
+            if result == -1 {
+                return Err(io::Error::last_os_error());
+            } else if result == 0 {
+                // Timeout, check RUNNING flag and continue
+                continue;
+            }
+            // Data is available, proceed with read
+        }
+        
         match file.read(&mut buffer) {
             Ok(n) if n >= event_size => {
                 let event_count = n / event_size;
@@ -164,11 +188,6 @@ fn monitor_device(device_path: &str) -> io::Result<()> {
                 }
             }
             Ok(_) => continue,
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                // Yield to other threads but continue polling immediately
-                std::thread::yield_now();
-                continue;
-            }
             Err(e) => return Err(e),
         }
     }
