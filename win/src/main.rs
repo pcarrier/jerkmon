@@ -273,10 +273,10 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
     }
 }
 
-fn send_display_event() {
+fn send_display_event(timestamp: Instant) {
     if let Some(tx) = EVENT_TX.get() {
         if let Some(start) = START_TIME.get() {
-            let now_ns = Instant::now().duration_since(*start).as_nanos() as u64;
+            let now_ns = timestamp.duration_since(*start).as_nanos() as u64;
             let last_ns = LAST_DISPLAY_NS.swap(now_ns, Ordering::Relaxed);
             let delta_ns = now_ns.saturating_sub(last_ns);
             let mut buf = vec![EVENT_TYPE_DISPLAY];
@@ -350,15 +350,17 @@ fn start_vblank_thread(output: IDXGIOutput) {
         while RUNNING.load(Ordering::Relaxed) {
             unsafe {
                 let _ = output.WaitForVBlank();
+                
+                // Capture timestamp immediately after vblank to minimize jitter
+                let timestamp = Instant::now();
 
-                let now = Instant::now();
-                let elapsed = now.duration_since(last_vblank);
+                let elapsed = timestamp.duration_since(last_vblank);
                 if elapsed < MIN_FRAME_TIME {
                     continue;
                 }
-                last_vblank = now;
+                last_vblank = timestamp;
 
-                send_display_event();
+                send_display_event(timestamp);
             }
         }
     });
@@ -387,13 +389,13 @@ fn process_raw_inputs(lparam: LPARAM) {
         if result != u32::MAX && size <= buffer.len() as u32 {
             let raw_input = &*(buffer.as_ptr() as *const RAWINPUT);
             if raw_input.header.dwType == RIM_TYPEMOUSE.0 {
-                send_mouse_event_with_timestamp(&raw_input.data.mouse, timestamp_ns);
+                send_mouse_event(&raw_input.data.mouse, timestamp_ns);
             }
         }
     }
 }
 
-fn send_mouse_event_with_timestamp(mouse_data: &RAWMOUSE, timestamp_ns: u64) {
+fn send_mouse_event(mouse_data: &RAWMOUSE, timestamp_ns: u64) {
     let dx = mouse_data.lLastX;
     let dy = mouse_data.lLastY;
 

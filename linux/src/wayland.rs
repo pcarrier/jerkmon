@@ -180,9 +180,12 @@ impl Dispatch<wl_callback::WlCallback, ()> for AppData {
         qh: &QueueHandle<Self>,
     ) {
         if let wl_callback::Event::Done { .. } = event {
+            // Capture timestamp immediately when frame callback is received to minimize jitter
+            let timestamp = Instant::now();
+            
             state.frame_pending = false;
 
-            send_display_event();
+            send_display_event_with_timestamp(timestamp);
 
             // Request next frame callback if still running
             if RUNNING.load(Ordering::Relaxed) {
@@ -338,9 +341,12 @@ fn create_buffer(
 }
 
 fn send_display_event() {
+    send_display_event_with_timestamp(Instant::now());
+}
+
+fn send_display_event_with_timestamp(timestamp: Instant) {
     if let Some(start) = START_TIME.get() {
-        let now = Instant::now();
-        let now_ns = now.duration_since(*start).as_nanos() as u64;
+        let now_ns = timestamp.duration_since(*start).as_nanos() as u64;
         let last_ns = LAST_DISPLAY_NS.swap(now_ns, Ordering::Relaxed);
         let delta_ns = now_ns.saturating_sub(last_ns);
 
