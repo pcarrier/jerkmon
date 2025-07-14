@@ -118,12 +118,11 @@ impl Dispatch<wl_buffer::WlBuffer, ()> for AppData {
     fn event(
         _: &mut Self,
         _: &wl_buffer::WlBuffer,
-        event: wl_buffer::Event,
+        _: wl_buffer::Event,
         _: &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        if let wl_buffer::Event::Release = event {}
     }
 }
 
@@ -182,10 +181,10 @@ impl Dispatch<wl_callback::WlCallback, ()> for AppData {
         if let wl_callback::Event::Done { .. } = event {
             // Capture timestamp immediately when frame callback is received to minimize jitter
             let timestamp = Instant::now();
-            
+
             state.frame_pending = false;
 
-            send_display_event_with_timestamp(timestamp);
+            send_display_event(timestamp);
 
             // Request next frame callback if still running
             if RUNNING.load(Ordering::Relaxed) {
@@ -255,9 +254,7 @@ pub fn monitor_wayland_frames() -> Result<(), Box<dyn std::error::Error>> {
         app_data.buffer = Some(buffer);
 
         // Commit the surface to trigger configure
-        if let Some(surface) = &app_data.surface {
-            surface.commit();
-        }
+        app_data.surface.as_ref().unwrap().commit();
     } else {
         utils::wait_for_shutdown();
         return Ok(());
@@ -313,7 +310,7 @@ fn create_buffer(
     // Create shared memory file
     let mut file = tempfile::tempfile()?;
     file.set_len(size as u64)?;
-    file.write_all(&vec![0x80; size])?; // Gray pixel
+    file.write_all(&[0x80; size])?; // Gray pixel
 
     // Create pool
     use std::os::unix::io::BorrowedFd;
@@ -340,11 +337,7 @@ fn create_buffer(
     Ok(buffer)
 }
 
-fn send_display_event() {
-    send_display_event_with_timestamp(Instant::now());
-}
-
-fn send_display_event_with_timestamp(timestamp: Instant) {
+fn send_display_event(timestamp: Instant) {
     if let Some(start) = START_TIME.get() {
         let now_ns = timestamp.duration_since(*start).as_nanos() as u64;
         let last_ns = LAST_DISPLAY_NS.swap(now_ns, Ordering::Relaxed);
