@@ -1,8 +1,8 @@
 #![cfg(windows)]
 #![windows_subsystem = "windows"]
 
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 use windows::{
@@ -34,7 +34,6 @@ static START_TIME: OnceLock<Instant> = OnceLock::new();
 static LAST_DISPLAY_NS: AtomicU64 = AtomicU64::new(0);
 static LAST_MOUSE_NS: AtomicU64 = AtomicU64::new(0);
 static RUNNING: AtomicBool = AtomicBool::new(true);
-static PENDING_MOUSE_EVENTS: OnceLock<Mutex<Vec<(u64, i32, i32)>>> = OnceLock::new();
 
 fn main() -> Result<()> {
     let result = main_internal();
@@ -67,9 +66,6 @@ fn main_internal() -> Result<()> {
     START_TIME
         .set(Instant::now())
         .expect("START_TIME already initialized");
-    PENDING_MOUSE_EVENTS
-        .set(Mutex::new(Vec::new()))
-        .expect("PENDING_MOUSE_EVENTS already initialized");
 
     std::thread::spawn(move || {
         let rt = match tokio::runtime::Runtime::new() {
@@ -177,6 +173,9 @@ async fn websocket_server(rx: crossbeam_channel::Receiver<Vec<u8>>) {
 
 fn create_window() -> Result<()> {
     unsafe {
+        // Set high priority for the main thread to reduce input processing jitter
+        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+
         let instance = GetModuleHandleW(None)?;
         let class = w!("jerkmon");
 
@@ -219,7 +218,6 @@ fn create_window() -> Result<()> {
         match init_minimal_dxgi(hwnd) {
             Ok((_, output)) => {
                 start_vblank_thread(output);
-                start_raw_input_thread();
             }
             Err(e) => {
                 show_error_dialog(
@@ -284,30 +282,6 @@ fn send_display_event() {
             let mut buf = vec![EVENT_TYPE_DISPLAY];
             buf.extend_from_slice(&delta_ns.to_be_bytes());
             let _ = tx.send(buf);
-        }
-    }
-}
-
-fn flush_pending_mouse_events() {
-    if let Some(pending) = PENDING_MOUSE_EVENTS.get() {
-        if let Some(tx) = EVENT_TX.get() {
-            if let Ok(mut events) = pending.lock() {
-                let mut last_ns = LAST_MOUSE_NS.load(Ordering::Relaxed);
-
-                for (timestamp_ns, dx, dy) in events.drain(..) {
-                    let delta_ns = timestamp_ns.saturating_sub(last_ns);
-                    last_ns = timestamp_ns;
-
-                    let mut buf = vec![EVENT_TYPE_MOUSE];
-                    buf.extend_from_slice(&delta_ns.to_be_bytes());
-                    buf.extend_from_slice(&(dx as f32).to_be_bytes());
-                    buf.extend_from_slice(&(dy as f32).to_be_bytes());
-
-                    let _ = tx.send(buf);
-                }
-
-                LAST_MOUSE_NS.store(last_ns, Ordering::Relaxed);
-            }
         }
     }
 }
@@ -384,8 +358,6 @@ fn start_vblank_thread(output: IDXGIOutput) {
                 }
                 last_vblank = now;
 
-                flush_pending_mouse_events();
-
                 send_display_event();
             }
         }
@@ -393,6 +365,13 @@ fn start_vblank_thread(output: IDXGIOutput) {
 }
 
 fn process_raw_inputs(lparam: LPARAM) {
+    // Take timestamp immediately to minimize jitter
+    let timestamp_ns = if let Some(start) = START_TIME.get() {
+        Instant::now().duration_since(*start).as_nanos() as u64
+    } else {
+        return;
+    };
+
     unsafe {
         let mut buffer = [0u8; 48]; // RAWINPUTHEADER + RAWMOUSE is typically 48 bytes
         let mut size = buffer.len() as u32;
@@ -408,65 +387,25 @@ fn process_raw_inputs(lparam: LPARAM) {
         if result != u32::MAX && size <= buffer.len() as u32 {
             let raw_input = &*(buffer.as_ptr() as *const RAWINPUT);
             if raw_input.header.dwType == RIM_TYPEMOUSE.0 {
-                send_mouse_event(&raw_input.data.mouse);
+                send_mouse_event_with_timestamp(&raw_input.data.mouse, timestamp_ns);
             }
         }
     }
 }
 
-fn start_raw_input_thread() {
-    std::thread::spawn(move || {
-        unsafe {
-            let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
-        }
-
-        const MAX_EVENTS: usize = 256;
-        let buffer_size = std::mem::size_of::<RAWINPUT>() * MAX_EVENTS;
-        let mut buffer = vec![0u8; buffer_size];
-
-        while RUNNING.load(Ordering::Relaxed) {
-            unsafe {
-                let mut size = buffer.len() as u32;
-                let result = GetRawInputBuffer(
-                    Some(buffer.as_mut_ptr() as *mut RAWINPUT),
-                    &mut size,
-                    std::mem::size_of::<RAWINPUTHEADER>() as u32,
-                );
-
-                if result > 0 && result != u32::MAX {
-                    // Process the returned events
-                    let count = result as usize;
-                    let mut ptr = buffer.as_ptr() as *const RAWINPUT;
-
-                    for _ in 0..count {
-                        let raw_input = &*ptr;
-                        if raw_input.header.dwType == RIM_TYPEMOUSE.0 {
-                            send_mouse_event(&raw_input.data.mouse);
-                        }
-
-                        // Move to next RAWINPUT based on header size
-                        let offset = raw_input.header.dwSize as usize;
-                        ptr = (ptr as *const u8).add(offset) as *const RAWINPUT;
-                    }
-                } else {
-                    // No events available, yield to other threads
-                    std::thread::yield_now();
-                }
-            }
-        }
-    });
-}
-
-fn send_mouse_event(mouse_data: &RAWMOUSE) {
+fn send_mouse_event_with_timestamp(mouse_data: &RAWMOUSE, timestamp_ns: u64) {
     let dx = mouse_data.lLastX;
     let dy = mouse_data.lLastY;
-    if let Some(pending) = PENDING_MOUSE_EVENTS.get() {
-        if let Some(start) = START_TIME.get() {
-            let now_ns = Instant::now().duration_since(*start).as_nanos() as u64;
 
-            if let Ok(mut events) = pending.lock() {
-                events.push((now_ns, dx, dy));
-            }
-        }
+    if let Some(tx) = EVENT_TX.get() {
+        let last_ns = LAST_MOUSE_NS.swap(timestamp_ns, Ordering::Relaxed);
+        let delta_ns = timestamp_ns.saturating_sub(last_ns);
+
+        let mut buf = vec![EVENT_TYPE_MOUSE];
+        buf.extend_from_slice(&delta_ns.to_be_bytes());
+        buf.extend_from_slice(&(dx as f32).to_be_bytes());
+        buf.extend_from_slice(&(dy as f32).to_be_bytes());
+
+        let _ = tx.send(buf);
     }
 }

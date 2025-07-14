@@ -1,7 +1,7 @@
 #![cfg(target_os = "linux")]
 
 //! Linux implementation of jerkmon - a high-performance input and display event monitor.
-//! 
+//!
 //! This program captures raw mouse input events via evdev and display refresh events
 //! via Wayland frame callbacks, then streams them over WebSocket in a binary protocol.
 
@@ -32,7 +32,7 @@ static RUNNING: AtomicBool = AtomicBool::new(true);
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Set high process priority
     set_high_priority();
-    
+
     // Initialize global state
     let (tx, rx) = crossbeam_channel::unbounded();
     EVENT_TX
@@ -47,12 +47,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
         rt.block_on(async {
             let server_handle = tokio::spawn(websocket::run_server(rx, WS_BIND_ADDR));
-            
+
             // Check for shutdown signal periodically
             while RUNNING.load(Ordering::Relaxed) {
                 tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
             }
-            
+
             // Abort the server task when shutting down
             server_handle.abort();
             let _ = server_handle.await;
@@ -96,7 +96,7 @@ fn set_high_priority() {
     unsafe {
         // Try to set nice value to -20 (highest priority)
         libc::setpriority(libc::PRIO_PROCESS, 0, -20);
-        
+
         // Also try to set real-time scheduling
         let param = libc::sched_param { sched_priority: 1 };
         libc::sched_setscheduler(0, libc::SCHED_FIFO, &param);

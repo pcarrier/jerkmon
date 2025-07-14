@@ -1,5 +1,5 @@
 //! WebSocket server module
-//! 
+//!
 //! Provides WebSocket server functionality for streaming events to connected clients.
 //! Handles client connections, broadcasts events to all connected clients, and manages
 //! client lifecycle including ping/pong heartbeats.
@@ -9,8 +9,8 @@ use std::sync::atomic::Ordering;
 
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpListener;
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::sync::Mutex;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 
 use crate::RUNNING;
@@ -36,7 +36,7 @@ pub async fn run_server(rx: crossbeam_channel::Receiver<Vec<u8>>, bind_addr: &st
 
     // Client management
     let clients = Arc::new(Mutex::new(Vec::<UnboundedSender<Vec<u8>>>::new()));
-    
+
     // Event broadcaster
     let clients_clone = clients.clone();
     tokio::spawn(async move {
@@ -70,9 +70,9 @@ async fn accept_connections(
                     if let Ok(ws) = accept_async(stream).await {
                         let (ws_tx, ws_rx) = ws.split();
                         let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
-                        
+
                         clients.lock().await.push(event_tx);
-                        
+
                         tokio::spawn(handle_client(ws_tx, ws_rx, event_rx));
                     }
                 }
@@ -87,8 +87,13 @@ async fn accept_connections(
 }
 
 async fn handle_client(
-    mut ws_tx: futures_util::stream::SplitSink<tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>, Message>,
-    mut ws_rx: futures_util::stream::SplitStream<tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>>,
+    mut ws_tx: futures_util::stream::SplitSink<
+        tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+        Message,
+    >,
+    mut ws_rx: futures_util::stream::SplitStream<
+        tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+    >,
     mut event_rx: UnboundedReceiver<Vec<u8>>,
 ) {
     loop {

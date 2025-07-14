@@ -77,8 +77,13 @@ func collectMouseIntervals(ctx context.Context, conn *websocket.Conn, duration t
 				// Main context expired, we're done
 				return intervals
 			}
+			if websocket.CloseStatus(err) != -1 {
+				// WebSocket was closed, return what we have
+				log.Printf("WebSocket closed: %v", err)
+				return intervals
+			}
 			if !errors.Is(err, context.DeadlineExceeded) {
-				log.Fatalf("WebSocket connection lost: %v", err)
+				log.Fatalf("WebSocket read error: %v", err)
 			}
 			continue
 		}
