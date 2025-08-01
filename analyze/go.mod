@@ -1,4 +1,4 @@
-module analyze
+module github.com/pcarrier/jerkmon/analyze
 
 go 1.21
 
