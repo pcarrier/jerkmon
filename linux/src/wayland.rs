@@ -305,18 +305,18 @@ fn create_buffer(
     shm: &wl_shm::WlShm,
     qh: &QueueHandle<AppData>,
 ) -> Result<wl_buffer::WlBuffer, Box<dyn std::error::Error>> {
-    let size = (WINDOW_WIDTH * WINDOW_HEIGHT * 4) as usize;
+    const WINDOW_SIZE: usize = (WINDOW_WIDTH * WINDOW_HEIGHT * 4) as usize;
 
     // Create shared memory file
     let mut file = tempfile::tempfile()?;
-    file.set_len(size as u64)?;
-    file.write_all(&[0x80; size])?; // Gray pixel
+    file.set_len(WINDOW_SIZE as u64)?;
+    file.write_all(&[0x80; WINDOW_SIZE])?; // Gray pixel
 
     // Create pool
     use std::os::unix::io::BorrowedFd;
     let pool = shm.create_pool(
         unsafe { BorrowedFd::borrow_raw(file.as_raw_fd()) },
-        size as i32,
+        WINDOW_SIZE as i32,
         qh,
         (),
     );
