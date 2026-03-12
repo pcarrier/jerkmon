@@ -42,6 +42,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .set(Instant::now())
         .map_err(|_| "START_TIME already initialized")?;
 
+    ctrlc::set_handler(|| {
+        RUNNING.store(false, Ordering::Relaxed);
+    })?;
+
     // Start WebSocket server
     let ws_handle = std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
@@ -64,10 +68,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let evdev_handles = evdev::start_monitors();
-
-    ctrlc::set_handler(|| {
-        RUNNING.store(false, Ordering::Relaxed);
-    })?;
 
     for handle in evdev_handles {
         let _ = handle.join();

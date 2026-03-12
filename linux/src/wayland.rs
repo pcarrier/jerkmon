@@ -3,7 +3,7 @@
 //! Creates a minimal Wayland window to receive frame callbacks for display timing.
 
 use std::io::Write;
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsFd, AsRawFd};
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
@@ -277,16 +277,32 @@ pub fn monitor_wayland_frames() -> Result<(), Box<dyn std::error::Error>> {
         surface.commit();
     }
 
-    // Event loop
+    // Event loop using poll to avoid busy-spinning
+    let wayland_fd = conn.as_fd();
+    let mut poll_fds = [libc::pollfd {
+        fd: std::os::unix::io::AsRawFd::as_raw_fd(&wayland_fd),
+        events: libc::POLLIN,
+        revents: 0,
+    }];
+
     while RUNNING.load(Ordering::Relaxed) {
+        event_queue.flush()?;
+
         if let Some(guard) = event_queue.prepare_read() {
-            let _ = guard.read();
+            let poll_result = unsafe { libc::poll(poll_fds.as_mut_ptr(), 1, 100) };
+            if poll_result > 0 {
+                let _ = guard.read();
+            } else {
+                guard.cancel();
+                if poll_result < 0 {
+                    return Err(std::io::Error::last_os_error().into());
+                }
+                continue;
+            }
         }
 
-        // Dispatch all pending events
         event_queue.dispatch_pending(&mut app_data)?;
 
-        // If no frame is pending, request one
         if !app_data.frame_pending && RUNNING.load(Ordering::Relaxed) {
             if let Some(surface) = &app_data.surface {
                 surface.frame(&qh, ());
@@ -294,8 +310,6 @@ pub fn monitor_wayland_frames() -> Result<(), Box<dyn std::error::Error>> {
                 surface.commit();
             }
         }
-
-        event_queue.flush()?;
     }
 
     Ok(())
