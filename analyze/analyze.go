@@ -155,6 +155,7 @@ func formatGnuplotScript(prefix string, intervals []float64) string {
 		}
 	}
 
+	sanitizedPrefix := strings.NewReplacer(`"`, `\"`, `\`, `\\`).Replace(prefix)
 	fmt.Fprintf(&b, `set terminal svg size 800,600 font "monospace,12"
 set output "%s.svg"
 
@@ -172,7 +173,7 @@ set format x "%%g"
 
 # Data
 $data << EOD
-`, prefix, minMs*0.9, maxMs*1.1)
+`, sanitizedPrefix, minMs*0.9, maxMs*1.1)
 
 	// Output each interval with its index
 	for i, interval := range intervals {

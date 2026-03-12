@@ -22,8 +22,8 @@ const REL_Y: u16 = 0x01;
 // Input event structure matching kernel's input_event
 #[repr(C)]
 struct InputEvent {
-    tv_sec: i64,
-    tv_usec: i64,
+    tv_sec: u64,
+    tv_usec: u64,
     type_: u16,
     code: u16,
     value: i32,
@@ -32,6 +32,7 @@ struct InputEvent {
 pub fn start_monitors() -> Vec<JoinHandle<()>> {
     let mut threads = Vec::new();
     let active_devices = Arc::new(Mutex::new(HashSet::new()));
+    let hotplug_handles: Arc<Mutex<Vec<JoinHandle<()>>>> = Arc::new(Mutex::new(Vec::new()));
 
     // Start monitoring existing devices
     let devices = find_mouse_devices();
@@ -50,10 +51,22 @@ pub fn start_monitors() -> Vec<JoinHandle<()>> {
 
     // Start device discovery thread to watch for new devices
     let active_devices_clone = active_devices.clone();
+    let hotplug_handles_clone = hotplug_handles.clone();
     let discovery_handle = std::thread::spawn(move || {
-        device_discovery_thread(active_devices_clone);
+        device_discovery_thread(active_devices_clone, hotplug_handles_clone);
     });
     threads.push(discovery_handle);
+
+    // Join any hotplug threads on shutdown
+    let hotplug_join_handle = std::thread::spawn(move || {
+        utils::wait_for_shutdown();
+        if let Ok(mut handles) = hotplug_handles.lock() {
+            for handle in handles.drain(..) {
+                let _ = handle.join();
+            }
+        }
+    });
+    threads.push(hotplug_join_handle);
 
     threads
 }
@@ -114,7 +127,7 @@ fn is_mouse_device(fd: i32) -> bool {
     let mut rel_bits = [0u8; 2]; // 2 bytes = 16 bits, enough for REL_X and REL_Y
 
     unsafe {
-        const EVIOCGBIT_REL: u32 = 0x80044522; // _IOR('E', 0x22, char[2])
+        const EVIOCGBIT_REL: u32 = 0x80024522; // _IOR('E', 0x22, char[2])
         let result = libc::ioctl(fd, EVIOCGBIT_REL as _, rel_bits.as_mut_ptr());
 
         if result >= 0 {
@@ -229,7 +242,7 @@ fn send_mouse_event(x: f32, y: f32) {
     }
 }
 
-fn device_discovery_thread(active_devices: Arc<Mutex<HashSet<String>>>) {
+fn device_discovery_thread(active_devices: Arc<Mutex<HashSet<String>>>, hotplug_handles: Arc<Mutex<Vec<JoinHandle<()>>>>) {
     // Use inotify to watch for new devices in /dev/input
     let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK) };
     if fd < 0 {
@@ -337,9 +350,10 @@ fn device_discovery_thread(active_devices: Arc<Mutex<HashSet<String>>>) {
                                         println!("New mouse detected: {}", device_path);
                                         let device_path_clone = device_path.clone();
                                         let active_devices_clone = active_devices.clone();
-                                        std::thread::spawn(move || {
+                                        let handle = std::thread::spawn(move || {
                                             let _ = monitor_device(&device_path_clone, active_devices_clone);
                                         });
+                                        hotplug_handles.lock().unwrap().push(handle);
                                     }
                                 }
                             }
