@@ -108,8 +108,18 @@ async fn websocket_server(rx: crossbeam_channel::Receiver<Vec<u8>>) {
 
     let (tx, mut rx_async) = tokio::sync::mpsc::unbounded_channel();
     std::thread::spawn(move || {
-        while let Ok(event) = rx.recv() {
-            let _ = tx.send(event);
+        loop {
+            match rx.recv_timeout(std::time::Duration::from_millis(100)) {
+                Ok(event) => {
+                    let _ = tx.send(event);
+                }
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                    if !RUNNING.load(Ordering::Relaxed) {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
         }
     });
 
@@ -347,9 +357,19 @@ fn start_vblank_thread(output: IDXGIOutput) {
         let mut last_vblank = Instant::now();
         const MIN_FRAME_TIME: std::time::Duration = std::time::Duration::from_micros(100);
 
+        let mut consecutive_errors = 0u32;
         while RUNNING.load(Ordering::Relaxed) {
             unsafe {
-                let _ = output.WaitForVBlank();
+                if output.WaitForVBlank().is_err() {
+                    consecutive_errors += 1;
+                    if consecutive_errors > 10 {
+                        eprintln!("Too many consecutive WaitForVBlank failures, stopping vblank thread");
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    continue;
+                }
+                consecutive_errors = 0;
                 
                 // Capture timestamp immediately after vblank to minimize jitter
                 let timestamp = Instant::now();

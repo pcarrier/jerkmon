@@ -1,6 +1,6 @@
 # Jerkmon Linux Version
 
-Linux implementation of jerkmon using HIDRAW for raw mouse input capture.
+Linux implementation of jerkmon using evdev for raw mouse input capture.
 
 ## Building
 
@@ -10,7 +10,7 @@ cargo build --release
 
 ## Running
 
-The application requires access to hidraw devices and DRM devices, so you'll need to run with appropriate permissions:
+The application requires access to evdev input devices, so you'll need to run with appropriate permissions:
 
 ```bash
 sudo ./target/release/jerkmon
@@ -25,8 +25,8 @@ sudo usermod -a -G input,video $USER
 
 ## Features
 
-- Raw mouse input capture using HIDRAW devices
-- Display refresh monitoring using DRM vblank events
+- Raw mouse input capture using evdev devices
+- Display refresh monitoring using Wayland frame callbacks
 - WebSocket server on `127.0.0.1:12345` for event streaming
 - Binary protocol compatible with Windows version
 
@@ -46,8 +46,8 @@ Events are sent as binary messages:
 
 ## Notes
 
-- The Linux version uses HIDRAW to read raw HID reports from mouse devices
-- Display refresh uses real DRM vblank events from `/dev/dri/card0`
-- If DRM device cannot be opened or vblank monitoring fails, display events will not be reported
-- Multiple hidraw devices are monitored simultaneously
+- The Linux version uses evdev to read raw input events from mouse devices
+- Display refresh uses Wayland frame callbacks
+- If Wayland connection fails, display events will not be reported
+- Multiple evdev devices are monitored simultaneously, with hot-plug support via inotify
 - Ctrl+C for graceful shutdown
